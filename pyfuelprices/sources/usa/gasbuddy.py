@@ -48,7 +48,7 @@ class GasBuddyUSASource(Source):
     async def _send_request(self, url) -> str:
         """Send a request to the API and return the raw response."""
         request_url = URL(url, encoded=True) if "mobile-orchestration" in url else url
-        _LOGGER.debug("Sending HTTP request to GasBuddy with URL %s", url)
+        _LOGGER.debug("Sending HTTP request to GasBuddy with URL %s", request_url)
         async with self._client_session.get(url=request_url,
                                             headers=self._headers) as response:
             if response.ok:
