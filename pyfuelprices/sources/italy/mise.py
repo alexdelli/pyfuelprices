@@ -19,9 +19,6 @@ from pyfuelprices.const import (
     PROP_FUEL_LOCATION_SOURCE,
     PROP_FUEL_LOCATION_PREVENT_CACHE_CLEANUP,
     PROP_FUEL_LOCATION_SOURCE_ID,
-    PROP_AREA_LAT,
-    PROP_AREA_LONG,
-    PROP_AREA_RADIUS,
 )
 from pyfuelprices.sources import Source
 from pyfuelprices.fuel_locations import Fuel, FuelLocation
@@ -35,20 +32,6 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-_KM_PER_MILE = 1.60934
-
-
-def _haversine_km(lat1, lon1, lat2, lon2) -> float:
-    """Calcola la distanza in km tra due coordinate geografiche."""
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1))
-         * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 class MISESource(Source):
@@ -68,10 +51,15 @@ class MISESource(Source):
     _headers = MISE_HEADERS
     update_interval = timedelta(hours=12)
 
-    location_cache: dict[str, FuelLocation] = {}
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # FIX: location_cache come attributo di istanza, non di classe,
+        # per evitare che due istanze condividano la stessa cache.
+        self.location_cache: dict[str, FuelLocation] = {}
 
-    _stations_raw: dict[str, dict] = {}
-    _prices_raw: dict[str, list] = {}
+    # ------------------------------------------------------------------
+    # Download CSV
+    # ------------------------------------------------------------------
 
     async def _download_csv(self, url: str) -> str | None:
         """Scarica un file CSV dall'URL indicato e restituisce il testo."""
@@ -79,21 +67,34 @@ class MISESource(Source):
         async with self._client_session.get(url, headers=self._headers) as resp:
             if resp.ok:
                 raw_bytes = await resp.read()
+                # FIX: prova prima UTF-8 (encoding piu' moderno e sicuro),
+                # poi latin-1 come fallback. latin-1 non fallisce mai quindi
+                # deve stare per secondo.
                 try:
-                    return raw_bytes.decode("latin-1")
+                    return raw_bytes.decode("utf-8")
                 except UnicodeDecodeError:
-                    return raw_bytes.decode("utf-8", errors="replace")
+                    return raw_bytes.decode("latin-1", errors="replace")
             _LOGGER.error(
                 "MISE Italy: errore HTTP %s scaricando %s", resp.status, url
             )
             return None
 
+    # ------------------------------------------------------------------
+    # Parsing CSV
+    # ------------------------------------------------------------------
+
     def _parse_stations_csv(self, text: str) -> dict[str, dict]:
-        """Legge il CSV anagrafica e restituisce un dizionario id->dati."""
+        """Legge il CSV anagrafica e restituisce un dizionario id->dati.
+
+        Il CSV inizia con una riga di metadati tipo 'Estrazione del 2026-04-12'
+        che viene saltata con next(f) prima di passare al DictReader.
+        """
         stations = {}
-        lines = text.splitlines()
-        content = "\n".join(lines[1:])
-        reader = csv.DictReader(io.StringIO(content), delimiter=MISE_CSV_SEPARATOR)
+        # FIX: uso un iteratore StringIO invece di splitlines()+join(),
+        # evitando di duplicare l'intero CSV in memoria.
+        f = io.StringIO(text)
+        next(f)  # salta la riga "Estrazione del ..."
+        reader = csv.DictReader(f, delimiter=MISE_CSV_SEPARATOR)
         for row in reader:
             sid = row.get("idImpianto", "").strip()
             if not sid:
@@ -103,6 +104,8 @@ class MISESource(Source):
                 lon = float(row.get("Longitudine", "0").replace(",", "."))
             except ValueError:
                 lat, lon = 0.0, 0.0
+            if lat == 0.0 and lon == 0.0:
+                continue
             stations[sid] = {
                 "id":        sid,
                 "gestore":   row.get("Gestore", "").strip(),
@@ -118,11 +121,16 @@ class MISESource(Source):
         return stations
 
     def _parse_prices_csv(self, text: str) -> dict[str, list]:
-        """Legge il CSV prezzi e restituisce un dizionario id->lista prezzi."""
+        """Legge il CSV prezzi e restituisce un dizionario id->lista prezzi.
+
+        Il CSV inizia con una riga di metadati tipo 'Estrazione del 2026-04-12'
+        che viene saltata con next(f) prima di passare al DictReader.
+        """
         prices: dict[str, list] = {}
-        lines = text.splitlines()
-        content = "\n".join(lines[1:])
-        reader = csv.DictReader(io.StringIO(content), delimiter=MISE_CSV_SEPARATOR)
+        # FIX: stessa ottimizzazione memoria del parser anagrafica.
+        f = io.StringIO(text)
+        next(f)  # salta la riga "Estrazione del ..."
+        reader = csv.DictReader(f, delimiter=MISE_CSV_SEPARATOR)
         for row in reader:
             sid = row.get("idImpianto", "").strip()
             if not sid:
@@ -141,6 +149,10 @@ class MISESource(Source):
         _LOGGER.debug("MISE Italy: letti prezzi per %d stazioni", len(prices))
         return prices
 
+    # ------------------------------------------------------------------
+    # pyfuelprices Source interface
+    # ------------------------------------------------------------------
+
     async def update(self, areas=None, force=False) -> list[FuelLocation]:
         """Scarica i due CSV e aggiorna la cache completa."""
         if self.next_update > datetime.now() and not force:
@@ -153,19 +165,19 @@ class MISESource(Source):
         prices_text   = await self._download_csv(MISE_PRICES_CSV_URL)
 
         if stations_text is None or prices_text is None:
-            _LOGGER.error("MISE Italy: impossibile scaricare i CSV, aggiornamento saltato")
+            _LOGGER.error(
+                "MISE Italy: impossibile scaricare i CSV, aggiornamento saltato"
+            )
             return list(self.location_cache.values())
 
-        self._stations_raw = self._parse_stations_csv(stations_text)
-        self._prices_raw   = self._parse_prices_csv(prices_text)
+        stations_raw = self._parse_stations_csv(stations_text)
+        prices_raw   = self._parse_prices_csv(prices_text)
 
-        for sid, station in self._stations_raw.items():
-            if sid not in self._prices_raw:
-                continue
-            if station["lat"] == 0.0 and station["lon"] == 0.0:
+        for sid, station in stations_raw.items():
+            if sid not in prices_raw:
                 continue
 
-            loc = self._build_location(station, self._prices_raw[sid])
+            loc = self._build_location(station, prices_raw[sid])
             if loc.id not in self.location_cache:
                 self.location_cache[loc.id] = loc
             else:
@@ -177,21 +189,9 @@ class MISESource(Source):
         )
         return list(self.location_cache.values())
 
-    async def search_sites(self, coordinates, radius: float) -> list[dict]:
-        """Restituisce le stazioni nel raggio (in miglia) dalle coordinate date."""
-        if not self.location_cache:
-            await self.update(force=True)
-
-        radius_km = radius * _KM_PER_MILE
-        results = []
-        for loc in self.location_cache.values():
-            dist_km = _haversine_km(
-                coordinates[0], coordinates[1], loc.lat, loc.long
-            )
-            if dist_km <= radius_km:
-                await loc.dynamic_build_fuels()
-                results.append({**loc.__dict__, "distance": dist_km / _KM_PER_MILE})
-        return results
+    # FIX: rimosso search_sites personalizzato — la classe base Source
+    # gestisce gia' la ricerca per distanza usando geopy, che e' gia'
+    # una dipendenza del progetto. Sovrascriverlo era ridondante.
 
     async def update_area(self, area: dict) -> bool:
         """Richiesto dalla classe base; deleghiamo tutto a update()."""
@@ -201,6 +201,10 @@ class MISESource(Source):
     async def parse_response(self, response) -> list[FuelLocation]:
         """Non usato in questa implementazione."""
         return list(self.location_cache.values())
+
+    # ------------------------------------------------------------------
+    # Costruzione FuelLocation
+    # ------------------------------------------------------------------
 
     def _build_location(self, station: dict, raw_prices: list) -> FuelLocation:
         """Crea un oggetto FuelLocation dai dati di una stazione."""
@@ -247,3 +251,4 @@ class MISESource(Source):
             if fuel_key not in best or is_self:
                 best[fuel_key] = price
         return [Fuel(fuel_type=k, cost=v, props={}) for k, v in best.items()]
+
